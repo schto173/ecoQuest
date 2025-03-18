@@ -1,0 +1,1 @@
+https://www.google.com/maps/d/u/1/viewer?mid=15p6B-vA18JFGeyz_cuSlqIrAEGSJ5BI&ll=50.52944515507395%2C18.09295008696364&z=17
