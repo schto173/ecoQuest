@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OLED Tacho Monitor</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="display-container">
+        <!-- Increase canvas resolution (e.g., 4x) -->
+        <canvas id="tachoCanvas" width="512" height="256"></canvas>
+
+        <!-- Overlays for text elements (positioning adjusted in CSS) -->
+        <div id="lapInfo" class="text-overlay lap-info-font">0/0</div>
+        <div id="currentTime" class="text-overlay time-info-font">THIS 00:00</div>
+        <div id="lastTime" class="text-overlay time-info-font">LAST 00:00</div>
+        <div id="mqttStatus" class="text-overlay error-font">!</div>
+        <div id="digitalSpeed" class="text-overlay digital-font">0</div>
+    </div>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="client.js"></script>
+</body>
+</html>

@@ -1,0 +1,102 @@
+body {
+    background-color: #333;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 100vh;
+    margin: 0;
+    font-family: 'DejaVu Sans', Arial, sans-serif; /* Approximation */
+}
+
+.display-container {
+    position: relative;
+    /* Set size to new canvas dimensions */
+    width: 512px;
+    height: 256px;
+    background-color: black;
+    border: 1px solid #555;
+    overflow: hidden;
+    /* Remove CSS scaling */
+    /* transform: scale(4); */
+    /* transform-origin: center center; */
+}
+
+#tachoCanvas {
+    display: block;
+    position: absolute;
+    top: 0;
+    left: 0;
+}
+
+.text-overlay {
+    position: absolute;
+    color: white;
+    white-space: nowrap;
+}
+
+/* Increase font sizes significantly (approx 4x original attempt) */
+.lap-info-font {
+    /* Corresponds to Python's 20px font */
+    font-size: 68px; /* Adjust as needed for visual match */
+    font-weight: bold;
+}
+.time-info-font {
+     /* Corresponds to Python's 10px font */
+    font-size: 36px; /* Adjust as needed */
+}
+.digital-font {
+     /* Corresponds to Python's 26px font */
+    font-size: 100px; /* Adjust as needed */
+    font-weight: bold;
+}
+.error-font {
+     /* Corresponds to Python's 8px font */
+     font-size: 20px; /* Adjust as needed */
+     font-weight: bold;
+}
+
+
+/* Adjust Text Positions for the 512x256 container */
+/* These are scaled versions of the Python coordinates */
+#lapInfo {
+    /* Python: (60, 20) anchor rb */
+    /* Meaning top-right corner is at 60, 20 */
+    top: 5px; /* Adjust vertical alignment based on font */
+    right: 310px; /* 512 - 240 = 272px from left */
+    text-align: right; /* Keep right alignment */
+    /* Or use left: 60*4 - textWidth (harder without measuring) */
+    /* Let's try positioning top-left based on Python anchor */
+    /* top: 20px - fontSize; */
+    /* right: 512px - (60*4); */
+
+}
+
+#currentTime {
+    /* Python: (0, 40) */
+    top: 160px; /* 160px */
+    left: 4; /* 0px */
+}
+
+#lastTime {
+    /* Python: (0, 52) */
+    top: 200px; /* 208px */
+    left: 4px; /* 0px */
+}
+
+#mqttStatus {
+    /* Python: (74, 0) */
+    top: 0 * 4; /* 0px */
+    left: 74 * 4; /* 296px */
+    display: none; /* Hidden by default */
+}
+
+#digitalSpeed {
+     /* Python: (128, 64) anchor rb */
+     /* Bottom right corner at 128, 64 */
+    bottom: 0px; /* Align bottom edge */
+    right: 0px; /* Align right edge */
+    /* Adjust padding if needed */
+    /* padding-right: 5px; */
+    /* padding-bottom: 5px; */
+    text-align: right;
+}
