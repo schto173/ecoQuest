@@ -2,9 +2,9 @@
 Racing Team's Exchange for Shell EcoMarathon @Lycée des Arts et Métiers
 
 # Connecting via SSH to RaspberryPi 
-Listening for WiFi Network: INSEL 
-via hostname: eco@eco.lan:22 
-via pitunnel: eco@eu1.pitunnel.com:23598 
+Listening for WiFi Network: INSEL
+via hostname: eco@eco.lan:22
+via pitunnel: eco@eu1.pitunnel.com:23598
 
 # Telemetry Server
 
