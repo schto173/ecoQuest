@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GPS Lap Line Configurator</title>
+    <!-- Leaflet CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <!-- Leaflet Draw CSS -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css" />
+    <!-- Custom CSS -->
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <h1>GPS Lap Line Configurator</h1>
+
+    <div class="config-area">
+        <label for="totalLaps">Total Laps:</label>
+        <input type="number" id="totalLaps" name="totalLaps" min="0" value="0">
+        <span>(Set 0 for endurance/practice)</span>
+    </div>
+
+    <div class="controls">
+        <button id="btnDrawStart">Draw Start Line</button>
+        <button id="btnDrawLap">Draw Lap Line</button>
+        <button id="btnDrawFinish">Draw Finish Line</button>
+        <button id="btnSaveLines" disabled>Save Lines & Config</button>
+        <button id="btnClear">Clear All</button>
+    </div>
+
+    <div id="map"></div>
+
+    <div class="status-area">
+        <p id="statusMessage">Load map and draw lines.</p>
+        <p>Current Drawing Mode: <span id="currentMode">None</span></p>
+    </div>
+
+    <!-- Leaflet JS -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <!-- Leaflet Draw JS -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.js"></script>
+    <!-- Custom JS -->
+    <script src="script.js"></script>
+</body>
+</html>

@@ -1,7 +1,7 @@
 # Scripts
 
-## GPS Sensor 
-location: /opt/gps.py
+## GPS Sensor -> Python
+location: /opt/gps.py  
 writing to MQTT: 
 - gps/postition  
 ```json
@@ -27,5 +27,8 @@ writing to MQTT:
   "signal_quality": "good"
 }
 ```
+
+## Wheel Speed -> Rust
+
 
 
