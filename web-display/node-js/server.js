@@ -12,6 +12,7 @@ const MQTT_PASSWORD = "marathon";
 const MQTT_TOPIC_GPS = "gps/status";
 const MQTT_TOPIC_SPEED = "car/speed"; // Listen for the speed published by the Pi
 const WEB_PORT = 3001; // Port for the web interface
+const IDEAL_LAP_TIME_S = 95.5;
 
 // --- Global State ---
 let mqttConnected = false;

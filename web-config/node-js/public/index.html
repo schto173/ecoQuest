@@ -5,9 +5,13 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>GPS Lap Line Configurator</title>
     <!-- Leaflet CSS -->
-    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+          integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+          crossorigin=""/>
     <!-- Leaflet Draw CSS -->
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css"
+          integrity="sha512-gc3xjCmIy673V6MyOAZhIW93xhM9ei1I+gLbmFjUHIjocENRsLX/QUE1htk5q1XV2D/iie/VQ8DXI6Vu8bexvQ=="
+          crossorigin="anonymous" referrerpolicy="no-referrer" />
     <!-- Custom CSS -->
     <link rel="stylesheet" href="style.css">
 </head>
@@ -15,9 +19,18 @@
     <h1>GPS Lap Line Configurator</h1>
 
     <div class="config-area">
-        <label for="totalLaps">Total Laps:</label>
-        <input type="number" id="totalLaps" name="totalLaps" min="0" value="0">
-        <span>(Set 0 for endurance/practice)</span>
+        <div> <!-- Grouping label and input -->
+            <label for="totalLaps">Total Laps:</label>
+            <input type="number" id="totalLaps" name="totalLaps" min="0" value="0" step="1">
+            <span>(0 for endurance)</span>
+        </div>
+
+        <div> <!-- Grouping label and input -->
+            <label for="idealTime">Ideal Lap Time (s):</label>
+            <!-- Set default value to 60 -->
+            <input type="number" id="idealTime" name="idealTime" min="0" value="60" step="any">
+            <span>(e.g., 95.5)</span>
+        </div>
     </div>
 
     <div class="controls">
@@ -31,12 +44,13 @@
     <div id="map"></div>
 
     <div class="status-area">
-        <p id="statusMessage">Load map and draw lines.</p>
+        <p id="statusMessage">Loading configuration...</p>
         <p>Current Drawing Mode: <span id="currentMode">None</span></p>
     </div>
 
     <!-- Leaflet JS -->
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
     <!-- Leaflet Draw JS -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.js"></script>
     <!-- Custom JS -->

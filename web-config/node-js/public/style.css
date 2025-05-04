@@ -5,20 +5,50 @@ body {
     flex-direction: column;
     align-items: center;
     padding: 1em;
+    margin: 0;
+    box-sizing: border-box;
+}
+
+h1 {
+    margin-bottom: 1em;
 }
 
 #map {
-    height: 500px;
-    width: 80%;
-    max-width: 800px;
+    height: 50vh; /* Relative height */
+    min-height: 400px; /* Minimum height */
+    width: 90%;
+    max-width: 900px;
     border: 1px solid #ccc;
     margin-top: 1em;
+    margin-bottom: 1em;
 }
 
-.controls, .config-area {
+.config-area {
+    display: flex;
+    flex-wrap: wrap; /* Allow wrapping */
+    justify-content: center; /* Center items horizontally */
+    gap: 15px; /* Space between config items */
+    margin-bottom: 1em;
+    padding: 10px;
+    border: 1px solid #eee;
+    border-radius: 5px;
+    background-color: #f9f9f9;
+    width: 90%;
+    max-width: 900px;
+    box-sizing: border-box;
+}
+
+.config-area > div { /* Style each label/input group */
+    display: flex;
+    align-items: center; /* Vertically align label and input */
+    gap: 5px; /* Space between label and input */
+}
+
+
+.controls {
     margin-bottom: 1em;
     display: flex;
-    gap: 10px; /* Spacing between buttons/inputs */
+    gap: 10px; /* Spacing between buttons */
     flex-wrap: wrap; /* Allow wrapping on smaller screens */
     justify-content: center;
 }
@@ -26,28 +56,89 @@ body {
 .controls button {
     padding: 8px 15px;
     cursor: pointer;
+    border: 1px solid #ccc;
+    background-color: #f0f0f0;
+    border-radius: 4px;
+    transition: background-color 0.2s ease;
 }
 
-.controls button.active {
-    background-color: #d3d3d3; /* Indicate active drawing button */
-    border-style: inset;
+.controls button:hover:not(:disabled) {
+     background-color: #e0e0e0;
 }
+
+
+.controls button:disabled {
+    cursor: not-allowed;
+    opacity: 0.6;
+}
+
+/* Style for the active drawing button */
+.controls button.active {
+    background-color: #cce5ff; /* Light blue background */
+    border-color: #99ccff;
+    font-weight: bold;
+}
+
+/* Style for the save button when enabled */
+#btnSaveLines:not(:disabled) {
+    background-color: #d4edda; /* Light green */
+    border-color: #c3e6cb;
+    font-weight: bold;
+}
+#btnSaveLines:not(:disabled):hover {
+    background-color: #c3e6cb;
+}
+
+/* Style for the clear button */
+#btnClear {
+    background-color: #f8d7da; /* Light red */
+    border-color: #f5c6cb;
+}
+#btnClear:hover {
+    background-color: #f5c6cb;
+}
+
 
 .status-area {
     margin-top: 1em;
     text-align: center;
+    width: 90%;
+    max-width: 900px;
 }
 
 #statusMessage {
     font-weight: bold;
+    min-height: 1.2em; /* Prevent layout shift when message changes */
+    padding: 5px;
+    border-radius: 3px;
 }
 
-.config-area label, .config-area span {
+/* Style status message based on content (can be enhanced with JS adding classes) */
+#statusMessage[style*="color: red"] { /* Basic check for error style */
+     background-color: #f8d7da;
+     border: 1px solid #f5c6cb;
+}
+
+
+.config-area label {
+    /* font-weight: bold; */ /* Optional: make labels bold */
     margin-right: 5px;
-    align-self: center;
+}
+.config-area span { /* Help text */
+     margin-left: 2px;
+     font-size: 0.9em;
+     color: #555;
 }
 
 .config-area input[type="number"] {
-    width: 60px;
-    padding: 5px;
+    width: 80px; /* Wider to accommodate decimals */
+    padding: 5px 8px;
+    text-align: right;
+    border: 1px solid #ccc;
+    border-radius: 3px;
+}
+
+/* Leaflet Draw specific overrides if needed */
+.leaflet-draw-toolbar a {
+    background-image: none !important; /* Example override */
 }

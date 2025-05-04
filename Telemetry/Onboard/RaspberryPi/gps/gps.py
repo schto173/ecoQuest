@@ -1,512 +1,608 @@
+#!/usr/bin/env python3
+
+import math
 import json
 import time
+from datetime import datetime, timezone # Added timezone
+import paho.mqtt.client as mqtt
 import serial
 import pynmea2
-import paho.mqtt.client as mqtt
-from datetime import datetime
+import threading
 import signal
 import sys
-import os
-import logging # Keep logging import for console output
+# import os # Keep os import if needed elsewhere (currently not)
 
-# Set up logging - Only to console (StreamHandler)
-logging.basicConfig(
-    level=logging.INFO, # INFO level provides good operational details
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        # Removed: logging.FileHandler("gps_monitor.log"),
-        logging.StreamHandler() # Log messages to the console (stderr by default)
-    ]
-)
-
-# MQTT Configuration
+# --- Constants ---
+SERIAL_PORT = '/dev/ttyS0' # Or '/dev/serial0' or your specific port
+BAUD_RATE = 115200
 MQTT_BROKER = "tome.lu"
 MQTT_PORT = 1883
-MQTT_TOPIC_POSITION = "gps/position"
-MQTT_TOPIC_STATUS = "gps/status"
 MQTT_USERNAME = "eco"
-MQTT_PASSWORD = "marathon" # Consider using environment variables or a config file for credentials
+MQTT_PASSWORD = "marathon" # Consider environment variables or config file
+MQTT_CLIENT_ID = "gps_monitor_pi"
 
-# Initialize MQTT client
-client = mqtt.Client()
-client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+# --- MQTT Topics ---
+MQTT_TOPIC_POSITION = "gps/position" # Lat, Lon, Speed(kmh), Heading, Alt, Timestamp
+MQTT_TOPIC_GPS_STATUS = "gps/status"   # Fix status, quality, satellites (Retained)
+MQTT_TOPIC_LAPS = "race/laps"          # Lap completion events (Not Retained)
 
-# Global serial connection for signal handler access
-ser = None
+# --- Configuration Topics ---
+MQTT_TOPIC_CONFIG_START = "config/start_line"
+MQTT_TOPIC_CONFIG_FINISH = "config/finish_line"
+MQTT_TOPIC_CONFIG_LAP = "config/lap_line"
+MQTT_TOPIC_CONFIG_TOTAL_LAPS = "config/total_laps"
 
-def signal_handler(sig, frame):
-    """Handle Ctrl+C and other termination signals gracefully"""
-    logging.info("Received termination signal. Cleaning up...")
+# --- Proximity Check Radius ---
+PROXIMITY_RADIUS_METERS = 25.0
 
-    # Close serial connection if open
-    global ser
-    if ser is not None and ser.is_open:
-        logging.info("Closing serial connection...")
-        try:
-            ser.close()
-        except Exception as e:
-            logging.error(f"Error closing serial port during cleanup: {e}")
+# --- Serial Error Handling ---
+serial_read_error_count = 0
+MAX_SERIAL_READ_ERRORS_BEFORE_RECONNECT = 10
 
-    # Disconnect MQTT if connected
-    if client.is_connected():
-        logging.info("Disconnecting from MQTT broker...")
-        client.loop_stop() # Stop the network loop
-        client.disconnect()
+# --- Speed Conversion ---
+KNOTS_TO_KMH = 1.852
 
-    logging.info("Cleanup complete. Exiting.")
-    sys.exit(0)
+# --- Global Variables ---
+gps_state = {
+    "latitude": None,
+    "longitude": None,
+    "altitude": None,
+    "timestamp": None,     # ISO Format UTC
+    "speed_knots": None,   # Store raw knots internally
+    "heading": None,
+    "has_fix": False,
+    "fix_quality": 0,
+    "num_satellites": 0,
+    "error_count": 0,
+    "last_valid_time": None,
+    "previous_position": None, # Store as (lon, lat)
+}
 
-# Register signal handlers for graceful shutdown
-signal.signal(signal.SIGINT, signal_handler)  # Handles Ctrl+C
-signal.signal(signal.SIGTERM, signal_handler) # Handles termination signals (e.g., from systemd)
+race_state = {
+    "start_line_p1": None, # Store as (lon, lat)
+    "start_line_p2": None, # Store as (lon, lat)
+    "finish_line_p1": None,
+    "finish_line_p2": None,
+    "lap_line_p1": None,
+    "lap_line_p2": None,
+    "total_laps": 0,
+    "current_lap": 0,
+    "current_lap_start_time": None, # Epoch seconds (internal use)
+    "race_finished": False,
+    # Internal debounce state
+    "_last_line_crossed_type": None,
+    "_last_cross_time_epoch": None,
+}
 
-def connect_mqtt():
-    """Establishes connection to the MQTT broker."""
-    try:
-        client.connect(MQTT_BROKER, MQTT_PORT, 60) # 60-second keepalive
-        client.loop_start() # Start background network loop
-        logging.info(f"Connected to MQTT broker at {MQTT_BROKER}:{MQTT_PORT}")
-        return True
-    except Exception as e:
-        logging.error(f"Failed to connect to MQTT broker: {e}")
+mqtt_client = None
+serial_connection = None
+shutdown_flag = threading.Event()
+last_status_publish_time = 0 # Track time for periodic status updates
+
+# --- Geometric Helper Functions (Unchanged) ---
+def on_segment(p, q, r):
+    """Check if point q lies on segment pr. Points are (lon, lat)."""
+    if p is None or q is None or r is None: return False # Added None check
+    if not (min(p[0], r[0]) <= q[0] <= max(p[0], r[0]) and
+            min(p[1], r[1]) <= q[1] <= max(p[1], r[1])):
         return False
+    val = (q[0] - p[0]) * (r[1] - p[1]) - (r[0] - p[0]) * (q[1] - p[1])
+    return abs(val) < 1e-9
 
-def connect_serial():
-    """Establishes connection to the serial port."""
-    global ser
-    port_name = '/dev/ttyS0' # Or make this configurable
-    baud_rate = 115200
-    timeout_sec = 0.5 # Read timeout
+def orientation(p, q, r):
+    """Find orientation of ordered triplet (p, q, r). Points are (lon, lat)."""
+    if p is None or q is None or r is None: return 0 # Treat None as collinear/indeterminate
+    val = (q[0] - p[0]) * (r[1] - p[1]) - (r[0] - p[0]) * (q[1] - p[1])
+    if abs(val) < 1e-9: return 0
+    return 1 if val > 0 else -1
+
+def intersect(p1, q1, p2, q2):
+    """Check if line segment 'p1q1' intersects line segment 'p2q2'. Points are (lon, lat)."""
+    if p1 is None or q1 is None or p2 is None or q2 is None: return False
+    o1 = orientation(p1, q1, p2); o2 = orientation(p1, q1, q2)
+    o3 = orientation(p2, q2, p1); o4 = orientation(p2, q2, q1)
+    if o1 != 0 and o2 != 0 and o3 != 0 and o4 != 0:
+        if o1 != o2 and o3 != o4: return True
+    if o1 == 0 and on_segment(p1, p2, q1): return True
+    if o2 == 0 and on_segment(p1, q2, q1): return True
+    if o3 == 0 and on_segment(p2, p1, q2): return True
+    if o4 == 0 and on_segment(p2, q1, q2): return True
+    return False
+
+def calculate_midpoint(p1, p2):
+    """Calculates the midpoint between two points (lon, lat)."""
+    if p1 is None or p2 is None: return None
+    return ((p1[0] + p2[0]) / 2.0, (p1[1] + p2[1]) / 2.0)
+
+def haversine_distance(p1, p2):
+    """Calculate the great-circle distance between two points (lon, lat). Returns meters."""
+    if p1 is None or p2 is None: return float('inf')
+    lon1, lat1, lon2, lat2 = map(math.radians, [p1[0], p1[1], p2[0], p2[1]])
+    dlon = lon2 - lon1; dlat = lat2 - lat1
+    a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    return 6371000 * c
+# --- End Geometric Helpers ---
+
+# --- Simplified Crossing Logic with Proximity (Unchanged) ---
+def is_crossing_line_with_proximity(line_p1, line_p2, prev_pos, curr_pos, radius_meters):
+    """Checks intersection and proximity to line center."""
+    if prev_pos is None or curr_pos is None or line_p1 is None or line_p2 is None: return False
+    if prev_pos == curr_pos: return False
+    if not intersect(line_p1, line_p2, prev_pos, curr_pos): return False
+    line_center = calculate_midpoint(line_p1, line_p2)
+    if line_center is None: return False
+    dist_prev_to_center = haversine_distance(prev_pos, line_center)
+    dist_curr_to_center = haversine_distance(curr_pos, line_center)
+    return (dist_prev_to_center <= radius_meters) or (dist_curr_to_center <= radius_meters)
+# --- End Crossing Logic ---
+
+# --- MQTT Callback Functions (Config Handling Unchanged) ---
+def on_connect(client, userdata, flags, rc, properties=None):
+    """Callback for when the client connects to the MQTT broker."""
+    if rc == 0:
+        print("Successfully connected to MQTT Broker.")
+        config_topics = [
+            (MQTT_TOPIC_CONFIG_START, 2), (MQTT_TOPIC_CONFIG_FINISH, 2),
+            (MQTT_TOPIC_CONFIG_LAP, 2), (MQTT_TOPIC_CONFIG_TOTAL_LAPS, 2)
+        ]
+        client.subscribe(config_topics)
+        print(f"Subscribed to config topics: {[t[0] for t in config_topics]}")
+        # Publish initial GPS status immediately on connect
+        publish_gps_status()
+    else:
+        print(f"Failed to connect to MQTT Broker, return code {rc}")
+
+def on_disconnect(client, userdata, flags, reason_code=None, properties=None):
+    print(f"Disconnected from MQTT Broker. Reason Code: {reason_code}")
+    if reason_code != 0:
+         print("Unexpected disconnection. Client will attempt to reconnect automatically.")
+
+def on_message(client, userdata, msg):
+    """Callback for received config messages."""
+    global race_state
+    topic = msg.topic
+    try:
+        payload = msg.payload.decode('utf-8')
+        if topic == MQTT_TOPIC_CONFIG_START:
+            data = json.loads(payload); race_state["start_line_p1"] = tuple(data['p1']); race_state["start_line_p2"] = tuple(data['p2'])
+            print(f"Updated Start Line: {race_state['start_line_p1']} -> {race_state['start_line_p2']}")
+        elif topic == MQTT_TOPIC_CONFIG_FINISH:
+            data = json.loads(payload); race_state["finish_line_p1"] = tuple(data['p1']); race_state["finish_line_p2"] = tuple(data['p2'])
+            print(f"Updated Finish Line: {race_state['finish_line_p1']} -> {race_state['finish_line_p2']}")
+        elif topic == MQTT_TOPIC_CONFIG_LAP:
+            data = json.loads(payload); race_state["lap_line_p1"] = tuple(data['p1']); race_state["lap_line_p2"] = tuple(data['p2'])
+            print(f"Updated Lap Line: {race_state['lap_line_p1']} -> {race_state['lap_line_p2']}")
+        elif topic == MQTT_TOPIC_CONFIG_TOTAL_LAPS:
+            try:
+                laps = int(payload)
+                if laps >= 0: race_state["total_laps"] = laps; print(f"Updated Total Laps: {race_state['total_laps']}")
+                else: print(f"Warning: Received invalid total laps value: {payload}")
+            except ValueError: print(f"Warning: Could not parse total laps value: {payload}")
+    except json.JSONDecodeError: print(f"Error decoding JSON from topic {topic}: {payload}")
+    except KeyError as e: print(f"Error processing message from topic {topic}: Missing key {e}")
+    except Exception as e: print(f"An unexpected error occurred in on_message for topic {topic}: {e}")
+
+def on_publish(client, userdata, mid, reason_code=None, properties=None):
+    pass # Optional logging
+# --- End MQTT Callbacks ---
+
+# --- GPS Data Processing (Unchanged logic, uses speed_knots internally) ---
+def get_utc_iso_timestamp():
+    """Returns the current UTC time in ISO 8601 format with Z."""
+    return datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+
+def update_from_nmea(nmea_sentence):
+    """Parses NMEA sentence and updates gps_state. Returns True if state changed."""
+    global gps_state
+    updated = False
+    initial_fix_status = gps_state["has_fix"]
+    initial_quality = gps_state["fix_quality"]
+    initial_sats = gps_state["num_satellites"]
 
     try:
-        ser = serial.Serial(port_name, baud_rate, timeout=timeout_sec)
-        logging.info(f"Connected to GPS serial port {port_name}")
-        return ser
-    except serial.SerialException as e:
-        logging.error(f"Failed to open serial port {port_name}: {e}")
-        # Common reasons: Permission denied (add user to 'dialout' group?), device not found, device busy
-        if "Permission denied" in str(e):
-             logging.error("Hint: Ensure the user running the script is in the 'dialout' group (e.g., sudo usermod -a -G dialout $USER) and reboot/re-login.")
-        return None
-    except Exception as e: # Catch other potential errors
-        logging.error(f"An unexpected error occurred opening serial port {port_name}: {e}")
-        return None
+        msg = pynmea2.parse(nmea_sentence)
+        current_valid = gps_state["longitude"] is not None and gps_state["latitude"] is not None
+        if current_valid:
+            gps_state["previous_position"] = (gps_state["longitude"], gps_state["latitude"])
+
+        # --- Process GGA ---
+        if isinstance(msg, pynmea2.types.talker.GGA):
+            new_fix_quality = msg.gps_qual if msg.gps_qual is not None else 0
+            gps_state["fix_quality"] = new_fix_quality
+            gps_state["num_satellites"] = int(msg.num_sats) if msg.num_sats else 0
+            gps_state["altitude"] = msg.altitude if hasattr(msg, 'altitude') else gps_state["altitude"] # Keep last known if not present
+
+            if new_fix_quality > 0 and msg.latitude is not None and msg.longitude is not None:
+                gps_state["latitude"] = msg.latitude
+                gps_state["longitude"] = msg.longitude
+                gps_state["has_fix"] = True
+                if hasattr(msg, 'timestamp') and msg.timestamp:
+                     # Prefer RMC's datetime, but use GGA time if RMC hasn't provided full date yet
+                     if gps_state["timestamp"] is None or len(gps_state["timestamp"]) < 15:
+                         today_date = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+                         # Ensure microseconds are handled correctly for ISO format
+                         time_str = msg.timestamp.strftime('%H:%M:%S.%f')
+                         gps_state["timestamp"] = f"{today_date}T{time_str[:-3]}Z" # Milliseconds precision
+                elif gps_state["timestamp"] is None: # Absolute fallback
+                     gps_state["timestamp"] = get_utc_iso_timestamp()
+                gps_state["last_valid_time"] = time.time()
+                updated = True
+            else:
+                gps_state["has_fix"] = False
+                # Keep last known lat/lon/alt
+
+        # --- Process RMC ---
+        elif isinstance(msg, pynmea2.types.talker.RMC):
+             if msg.status == 'A' and msg.latitude is not None and msg.longitude is not None:
+                 gps_state["latitude"] = msg.latitude
+                 gps_state["longitude"] = msg.longitude
+                 gps_state["speed_knots"] = msg.spd_over_grnd if msg.spd_over_grnd is not None else 0.0
+                 gps_state["heading"] = msg.true_course if hasattr(msg, 'true_course') and msg.true_course is not None else gps_state["heading"] # Keep last known
+
+                 if hasattr(msg, 'datetime') and msg.datetime:
+                     try:
+                         # Use combined date and time from RMC for best timestamp
+                         gps_state["timestamp"] = msg.datetime.replace(tzinfo=timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+                     except Exception:
+                         gps_state["timestamp"] = get_utc_iso_timestamp() # Fallback UTC now
+                 elif gps_state["timestamp"] is None: # Fallback if RMC has no datetime
+                      gps_state["timestamp"] = get_utc_iso_timestamp()
+
+                 gps_state["has_fix"] = True
+                 gps_state["last_valid_time"] = time.time()
+                 if gps_state["fix_quality"] == 0: gps_state["fix_quality"] = 1 # Basic fix
+                 updated = True
+             elif msg.status == 'V':
+                 gps_state["has_fix"] = False
+                 gps_state["fix_quality"] = 0
+                 gps_state["speed_knots"] = 0.0
+                 # Keep last known lat/lon/alt/heading
+
+        # Determine if status actually changed for publication trigger
+        status_changed = (gps_state["has_fix"] != initial_fix_status or
+                          gps_state["fix_quality"] != initial_quality or
+                          gps_state["num_satellites"] != initial_sats)
+
+        # Ensure previous_position is set if we just got the *first* valid fix
+        if updated and gps_state["has_fix"] and gps_state["previous_position"] is None and current_valid:
+             gps_state["previous_position"] = (gps_state["longitude"], gps_state["latitude"])
+
+    except pynmea2.ParseError:
+        gps_state["error_count"] += 1; status_changed = False
+    except AttributeError as e:
+        print(f"NMEA Attribute Error: {e} in sentence: {nmea_sentence.strip()}"); gps_state["error_count"] += 1; status_changed = False
+    except Exception as e:
+        print(f"Unexpected error parsing NMEA: {e}"); gps_state["error_count"] += 1; status_changed = False
+
+    # Return True only if relevant status fields changed
+    return status_changed
+# --- End GPS Processing ---
 
 
-class GPSData:
-    """Holds and updates GPS state based on NMEA sentences."""
-    def __init__(self):
-        self.position_data = {
-            'timestamp': '', 'latitude': None, 'longitude': None,
-            'altitude': None, 'speed': None, 'heading': None
-        }
-        self.status_data = {
-            'status': 'initializing', 'satellites_used': 0, 'satellites_visible': 0,
-            'hdop': None, 'fix_type': 'No Fix', 'last_fix_time': None,
-            'uptime': 0, 'signal_quality': 'poor'
-        }
-        self.has_fix = False
-        self.last_update = 0
-        self.fix_lost_time = 0
-        self.start_time = time.time()
+# --- Lap Timing Logic (Unchanged) ---
+def update_lap_status():
+    """Checks for line crossings and publishes lap events to MQTT."""
+    global race_state, gps_state, mqtt_client
+    if race_state["race_finished"] or not gps_state["has_fix"]: return
+    if race_state["total_laps"] <= 0: return
+    current_pos = (gps_state["longitude"], gps_state["latitude"])
+    prev_pos = gps_state["previous_position"]
+    if current_pos is None or prev_pos is None: return
 
-    def _update_signal_quality(self):
-        """Updates signal quality based on HDOP."""
-        if self.status_data['hdop'] is None:
-            self.status_data['signal_quality'] = 'poor'
-        elif self.status_data['hdop'] < 1.0:
-            self.status_data['signal_quality'] = 'excellent'
-        elif self.status_data['hdop'] < 2.0:
-            self.status_data['signal_quality'] = 'good'
-        elif self.status_data['hdop'] < 5.0:
-            self.status_data['signal_quality'] = 'moderate'
-        else:
-            self.status_data['signal_quality'] = 'poor'
+    now_epoch = time.time()
+    now_iso = get_utc_iso_timestamp()
+    crossed_line_type_this_update = None
+    debounce_seconds = 2.0
 
-    def update_from_nmea(self, msg):
-        """Updates position and status data from a parsed NMEA message."""
-        current_time = time.time()
-        old_fix_status = self.has_fix
-        self.status_data['uptime'] = int(current_time - self.start_time) # Update uptime regardless of message type
+    # --- Check Start Line ---
+    if race_state["current_lap"] == 0 and race_state["start_line_p1"] and race_state["start_line_p2"]:
+        if is_crossing_line_with_proximity(race_state["start_line_p1"], race_state["start_line_p2"], prev_pos, current_pos, PROXIMITY_RADIUS_METERS):
+            if race_state["_last_line_crossed_type"] != 'start' or (now_epoch - (race_state.get("_last_cross_time_epoch", 0) or 0)) > debounce_seconds:
+                print(f"--- Crossed START Line at {now_iso} ---")
+                race_state["current_lap"] = 1; race_state["current_lap_start_time"] = now_epoch
+                race_state["_last_line_crossed_type"] = 'start'; race_state["_last_cross_time_epoch"] = now_epoch
+                crossed_line_type_this_update = 'start'
+                lap_payload = {"event": "race_started", "start_time_iso": now_iso, "lap_number_starting": 1, "total_laps": race_state["total_laps"]}
+                publish_to_mqtt(MQTT_TOPIC_LAPS, lap_payload, qos=1, retain=False)
 
+    # --- Check Lap Line ---
+    elif 0 < race_state["current_lap"] <= race_state["total_laps"] and race_state["lap_line_p1"] and race_state["lap_line_p2"]:
+        is_finish_line_same_as_lap = (race_state["lap_line_p1"] == race_state["finish_line_p1"] and race_state["lap_line_p2"] == race_state["finish_line_p2"])
+        should_check_lap = not (race_state["current_lap"] == race_state["total_laps"] and is_finish_line_same_as_lap)
+        if should_check_lap and is_crossing_line_with_proximity(race_state["lap_line_p1"], race_state["lap_line_p2"], prev_pos, current_pos, PROXIMITY_RADIUS_METERS):
+            if race_state["_last_line_crossed_type"] != 'lap' or (now_epoch - (race_state.get("_last_cross_time_epoch", 0) or 0)) > debounce_seconds:
+                lap_just_completed = race_state["current_lap"]
+                print(f"--- Crossed LAP Line at {now_iso} (Completed Lap {lap_just_completed}) ---")
+                lap_duration = None; start_time_iso = None
+                if race_state["current_lap_start_time"] is not None:
+                    lap_duration = now_epoch - race_state["current_lap_start_time"]
+                    start_time_iso = datetime.fromtimestamp(race_state["current_lap_start_time"], timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+                    print(f"    Lap {lap_just_completed} Time: {lap_duration:.2f}s")
+                lap_payload = {"event": "lap_completed", "lap_number": lap_just_completed, "start_time_iso": start_time_iso, "end_time_iso": now_iso, "duration_seconds": lap_duration, "total_laps": race_state["total_laps"]}
+                publish_to_mqtt(MQTT_TOPIC_LAPS, lap_payload, qos=1, retain=False)
+                race_state["current_lap"] += 1; race_state["current_lap_start_time"] = now_epoch
+                race_state["_last_line_crossed_type"] = 'lap'; race_state["_last_cross_time_epoch"] = now_epoch
+                crossed_line_type_this_update = 'lap'
+                if race_state["current_lap"] > race_state["total_laps"]:
+                    print("--- RACE FINISHED (by completing last lap via Lap Line) ---")
+                    race_state["race_finished"] = True
+                    finish_payload = {"event": "race_finished", "finish_time_iso": now_iso, "final_lap_number": lap_just_completed, "final_lap_duration_seconds": lap_duration}
+                    publish_to_mqtt(MQTT_TOPIC_LAPS, finish_payload, qos=1, retain=False)
+
+    # --- Check Finish Line ---
+    if race_state["current_lap"] == race_state["total_laps"] and not race_state["race_finished"] and race_state["finish_line_p1"] and race_state["finish_line_p2"]:
+        is_finish_line_same_as_lap = (race_state["lap_line_p1"] == race_state["finish_line_p1"] and race_state["lap_line_p2"] == race_state["finish_line_p2"])
+        if crossed_line_type_this_update != 'lap' or is_finish_line_same_as_lap:
+            if is_crossing_line_with_proximity(race_state["finish_line_p1"], race_state["finish_line_p2"], prev_pos, current_pos, PROXIMITY_RADIUS_METERS):
+                if race_state["_last_line_crossed_type"] != 'finish' or (now_epoch - (race_state.get("_last_cross_time_epoch", 0) or 0)) > debounce_seconds:
+                    print(f"--- Crossed FINISH Line at {now_iso} ---")
+                    lap_just_completed = race_state["current_lap"]
+                    lap_duration = None; start_time_iso = None
+                    if race_state["current_lap_start_time"] is not None:
+                         lap_duration = now_epoch - race_state["current_lap_start_time"]
+                         start_time_iso = datetime.fromtimestamp(race_state["current_lap_start_time"], timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+                         print(f"    Final Lap ({lap_just_completed}) Time: {lap_duration:.2f}s")
+                    race_state["race_finished"] = True
+                    race_state["_last_line_crossed_type"] = 'finish'; race_state["_last_cross_time_epoch"] = now_epoch
+                    crossed_line_type_this_update = 'finish'
+                    lap_payload = {"event": "lap_completed", "lap_number": lap_just_completed, "start_time_iso": start_time_iso, "end_time_iso": now_iso, "duration_seconds": lap_duration, "total_laps": race_state["total_laps"], "race_finished_flag": True}
+                    publish_to_mqtt(MQTT_TOPIC_LAPS, lap_payload, qos=1, retain=False)
+                    finish_payload = {"event": "race_finished", "finish_time_iso": now_iso, "final_lap_number": lap_just_completed, "final_lap_duration_seconds": lap_duration}
+                    publish_to_mqtt(MQTT_TOPIC_LAPS, finish_payload, qos=1, retain=False)
+# --- End Lap Timing ---
+
+
+# --- Publishing Functions (Revised position data) ---
+
+def publish_to_mqtt(topic, payload_dict, qos=0, retain=False):
+    """Helper function to publish JSON payload to a topic."""
+    global mqtt_client
+    if mqtt_client and mqtt_client.is_connected():
         try:
-            if isinstance(msg, pynmea2.GGA):
-                # Satellites Used
-                if hasattr(msg, 'num_sats') and msg.num_sats is not None:
-                    try:
-                        self.status_data['satellites_used'] = int(msg.num_sats)
-                    except (ValueError, TypeError):
-                        logging.warning(f"Could not parse GGA num_sats: {msg.num_sats}")
-                        self.status_data['satellites_used'] = 0
-                else:
-                    self.status_data['satellites_used'] = 0
-
-                # HDOP
-                if hasattr(msg, 'horizontal_dil') and msg.horizontal_dil is not None:
-                    try:
-                        self.status_data['hdop'] = float(msg.horizontal_dil)
-                    except (ValueError, TypeError):
-                        logging.warning(f"Could not parse GGA HDOP: {msg.horizontal_dil}")
-                        self.status_data['hdop'] = None
-                else:
-                    self.status_data['hdop'] = None # Reset HDOP if not present
-                self._update_signal_quality() # Update quality based on HDOP
-
-                # Fix Status & Position
-                fix_quality = 0
-                if hasattr(msg, 'gps_qual') and msg.gps_qual is not None:
-                     try:
-                          fix_quality = int(msg.gps_qual)
-                     except (ValueError, TypeError):
-                          fix_quality = 0
-
-                if fix_quality > 0:
-                    self.has_fix = True
-                    self.status_data['status'] = 'position'
-                    self.status_data['last_fix_time'] = datetime.utcnow().isoformat() + 'Z'
-
-                    # Latitude / Longitude (essential for position)
-                    if hasattr(msg, 'latitude') and msg.latitude is not None and \
-                       hasattr(msg, 'longitude') and msg.longitude is not None:
-                        try:
-                            self.position_data['latitude'] = float(msg.latitude)
-                            self.position_data['longitude'] = float(msg.longitude)
-                            # Use UTC time from system, NMEA time can be unreliable until fix
-                            self.position_data['timestamp'] = datetime.utcnow().isoformat() + 'Z'
-                        except (ValueError, TypeError):
-                             logging.warning(f"Could not parse GGA lat/lon: {msg.latitude}/{msg.longitude}")
-                             self.position_data['latitude'] = None
-                             self.position_data['longitude'] = None
-                             self.has_fix = False # Can't have a fix without lat/lon
-                    else:
-                         self.has_fix = False # Can't have a fix without lat/lon
-
-                    # Altitude
-                    if hasattr(msg, 'altitude') and msg.altitude is not None:
-                        try:
-                            self.position_data['altitude'] = float(msg.altitude)
-                        except (ValueError, TypeError):
-                            logging.warning(f"Could not parse GGA altitude: {msg.altitude}")
-                            self.position_data['altitude'] = None
-                    else:
-                        self.position_data['altitude'] = None # Explicitly clear if not present
-                else:
-                    # No fix based on GGA quality indicator
-                    self.has_fix = False
-                    self.status_data['status'] = 'searching'
-                    if old_fix_status and not self.fix_lost_time: # Record when fix was first lost
-                        self.fix_lost_time = current_time
-
-            elif isinstance(msg, pynmea2.RMC):
-                 # RMC provides speed and heading. Also confirms fix status ('A').
-                 rmc_status_active = hasattr(msg, 'status') and msg.status == 'A'
-
-                 # Speed
-                 speed_val = None
-                 if rmc_status_active and hasattr(msg, 'spd_over_grnd') and msg.spd_over_grnd is not None:
-                     try:
-                         # Convert knots to km/h
-                         speed_val = float(msg.spd_over_grnd) * 1.852
-                     except (ValueError, TypeError):
-                          logging.warning(f"Could not parse RMC speed: {msg.spd_over_grnd}")
-                 self.position_data['speed'] = speed_val # Assign found value or None
-
-                 # Heading - Prefer true_course, fallback to cog
-                 heading_val = None
-                 if rmc_status_active:
-                     if hasattr(msg, 'true_course') and msg.true_course is not None:
-                          try:
-                              heading_val = float(msg.true_course)
-                          except (ValueError, TypeError):
-                              logging.warning(f"Could not parse RMC true_course: {msg.true_course}")
-                     # Check hasattr before accessing cog
-                     elif hasattr(msg, 'cog') and msg.cog is not None: # Check cog only if true_course failed/missing
-                          try:
-                              heading_val = float(msg.cog)
-                              # logging.debug(f"Using COG ({heading_val}) as heading.") # Optional debug log
-                          except (ValueError, TypeError):
-                              logging.warning(f"Could not parse RMC cog: {msg.cog}")
-                 self.position_data['heading'] = heading_val # Assign found value or None
-
-                 # RMC status 'V' (Void) implies no fix, update status if GGA hasn't already
-                 if not rmc_status_active and self.has_fix:
-                      logging.info("RMC status is 'V', marking fix as lost.")
-                      self.has_fix = False
-                      self.status_data['status'] = 'searching'
-                      if old_fix_status and not self.fix_lost_time:
-                           self.fix_lost_time = current_time
-
-
-            elif isinstance(msg, pynmea2.GSA):
-                # Fix Type (2D/3D)
-                fix_type = 'No Fix'
-                if hasattr(msg, 'mode_fix_type'):
-                    if msg.mode_fix_type == '3':
-                        fix_type = '3D'
-                    elif msg.mode_fix_type == '2':
-                        fix_type = '2D'
-                self.status_data['fix_type'] = fix_type
-
-                # GSA HDOP (use as fallback if GGA didn't provide it)
-                if self.status_data['hdop'] is None and hasattr(msg, 'hdop') and msg.hdop is not None:
-                    try:
-                        self.status_data['hdop'] = float(msg.hdop)
-                        self._update_signal_quality()
-                    except (ValueError, TypeError):
-                         logging.warning(f"Could not parse GSA HDOP: {msg.hdop}")
-                         self.status_data['hdop'] = None
-                         self._update_signal_quality()
-
-
-            elif isinstance(msg, pynmea2.GSV):
-                # Satellites Visible (only use first message in sequence)
-                try:
-                    if hasattr(msg, 'msg_num') and msg.msg_num is not None and \
-                       hasattr(msg, 'num_sv_in_view') and msg.num_sv_in_view is not None:
-                        msg_num = int(msg.msg_num)
-                        if msg_num == 1: # Only update on the first message
-                            self.status_data['satellites_visible'] = int(msg.num_sv_in_view)
-                except (ValueError, TypeError) as e:
-                    logging.warning(f"Error processing GSV message: {e} - Data: {msg}")
-
-        except AttributeError as e:
-             # This can happen if pynmea2 encounters unexpected field variations
-             logging.warning(f"Attribute error parsing NMEA data: {e} - Sentence: {msg}")
+            # Ensure all data is JSON serializable (esp. timestamps)
+            payload_json = json.dumps(payload_dict, default=str) # Use default=str as fallback
+            result = mqtt_client.publish(topic, payload_json, qos=qos, retain=retain)
+            # print(f"Published to {topic}: {payload_json}") # Debug
+        except TypeError as e:
+            print(f"Error serializing JSON for topic {topic}: {e} - Payload: {payload_dict}")
         except Exception as e:
-            # Catch-all for other parsing issues
-            logging.error(f"Error parsing NMEA data type {type(msg).__name__}: {e}")
+            print(f"Error publishing to MQTT topic {topic}: {e}")
 
-        # --- Post-processing after parsing a message ---
+def publish_position_data():
+    """Publishes core position data (speed in km/h) to MQTT_TOPIC_POSITION."""
+    global gps_state
+    # Only publish if we have a valid fix and essential data
+    if gps_state["has_fix"] and gps_state["latitude"] is not None and gps_state["longitude"] is not None:
+        # Convert speed to km/h for publishing
+        speed_kmh = None
+        if gps_state["speed_knots"] is not None:
+            speed_kmh = round(gps_state["speed_knots"] * KNOTS_TO_KMH, 2) # Round to 2 decimal places
 
-        # If fix status changed from True to False, record the time
-        if old_fix_status and not self.has_fix and not self.fix_lost_time:
-             self.fix_lost_time = current_time
+        payload = {
+            "latitude": gps_state["latitude"],
+            "longitude": gps_state["longitude"],
+            "altitude": gps_state["altitude"],
+            "speed_kmh": speed_kmh, # Publish speed in km/h
+            "heading": gps_state["heading"],
+            "timestamp": gps_state["timestamp"], # Already ISO format UTC
+        }
+        publish_to_mqtt(MQTT_TOPIC_POSITION, payload, qos=1, retain=False)
 
-        # If we've lost fix for more than 5 seconds, clear potentially stale position data
-        if not self.has_fix and self.fix_lost_time and (current_time - self.fix_lost_time > 5):
-            logging.info("Fix lost for > 5 seconds, clearing position data.")
-            self.position_data['latitude'] = None
-            self.position_data['longitude'] = None
-            self.position_data['altitude'] = None
-            self.position_data['speed'] = None
-            self.position_data['heading'] = None
-            self.position_data['timestamp'] = '' # Clear timestamp too
-            self.fix_lost_time = 0 # Reset timer after clearing
+def publish_gps_status():
+    """Publishes GPS fix status and quality to MQTT_TOPIC_GPS_STATUS."""
+    global gps_state, last_status_publish_time
+    payload = {
+        "has_fix": gps_state["has_fix"],
+        "fix_quality": gps_state["fix_quality"],
+        "num_satellites": gps_state["num_satellites"],
+        "timestamp": get_utc_iso_timestamp() # Timestamp of the status update itself
+    }
+    # Publish status regardless of fix, retain the latest status
+    publish_to_mqtt(MQTT_TOPIC_GPS_STATUS, payload, qos=1, retain=True)
+    last_status_publish_time = time.time() # Record time of this publish
 
-        # If we regained fix, reset the fix lost timer
-        if self.has_fix and self.fix_lost_time:
-            logging.info("GPS fix regained.")
-            self.fix_lost_time = 0
+# --- End Publishing Functions ---
 
-        self.last_update = current_time
 
-    def get_position_json(self):
-        """Returns position data as JSON string, only if lat/lon are valid."""
-        # Essential check: must have lat and lon for a valid position message
-        if self.position_data['latitude'] is not None and self.position_data['longitude'] is not None:
-            # Create a copy containing only non-None values for cleaner JSON
-            position_copy = {k: v for k, v in self.position_data.items() if v is not None and v != ''}
-            # Ensure timestamp is always present if we have lat/lon
-            if 'timestamp' not in position_copy:
-                 position_copy['timestamp'] = datetime.utcnow().isoformat() + 'Z'
-            return json.dumps(position_copy)
-        return None # Return None if no valid lat/lon
+# --- Serial Port Handling (Revised: triggers status publish on change) ---
 
-    def get_status_json(self):
-        """Returns status data as JSON string."""
-        # Create a copy containing only non-None values
-        status_copy = {k: v for k, v in self.status_data.items() if v is not None}
-        # Ensure uptime is always present
-        if 'uptime' not in status_copy:
-            status_copy['uptime'] = int(time.time() - self.start_time)
-        return json.dumps(status_copy)
+def read_from_serial():
+    """Reads lines from serial port, processes NMEA, triggers publishes."""
+    global serial_connection, gps_state, shutdown_flag, serial_read_error_count
+    print("Serial reading thread started.")
+    while not shutdown_flag.is_set():
+        processed_line = False
+        if serial_connection and serial_connection.is_open:
+            try:
+                if serial_connection.in_waiting > 0:
+                    line = serial_connection.readline()
+                    processed_line = True # We attempted to process something
+                    if line:
+                        if serial_read_error_count > 0: print("Serial communication resumed.")
+                        serial_read_error_count = 0
+                        try:
+                            nmea_sentence = line.decode('utf-8', errors='ignore').strip()
+                            if nmea_sentence.startswith('$'):
+                                # update_from_nmea returns True if status fields changed
+                                if update_from_nmea(nmea_sentence):
+                                    # Publish status immediately if it changed
+                                    publish_gps_status()
+
+                                # Publish position and check laps only if we have a fix
+                                if gps_state["has_fix"]:
+                                    publish_position_data()
+                                    update_lap_status()
+                            # else: Ignore non-NMEA lines
+                        except UnicodeDecodeError: gps_state["error_count"] += 1
+                        except Exception as e: print(f"Error processing serial line: {e}"); gps_state["error_count"] += 1
+                    else: # Readline returned empty data
+                        serial_read_error_count += 1; time.sleep(0.1)
+                else: # No data waiting
+                    if serial_read_error_count > 0: serial_read_error_count = 0
+                    # No data, sleep briefly before checking periodic publish in main loop
+                    time.sleep(0.05)
+
+                # Reconnect logic (unchanged)
+                if serial_read_error_count >= MAX_SERIAL_READ_ERRORS_BEFORE_RECONNECT:
+                    print(f"Max serial read errors ({serial_read_error_count}) reached. Reconnecting.")
+                    close_serial(); time.sleep(0.1); open_serial(); serial_read_error_count = 0
+
+            except (serial.SerialException, IOError) as e:
+                print(f"Serial Exception/IO Error: {e}. Reconnecting.")
+                close_serial(); time.sleep(0.1); open_serial(); serial_read_error_count = 0
+            except Exception as e:
+                print(f"Unexpected error in serial read loop: {e}"); serial_read_error_count += 1; time.sleep(0.1)
+        else: # Serial port not open
+            # Wait longer before retrying to open, main loop handles periodic status
+            time.sleep(1.0)
+            open_serial(); serial_read_error_count = 0
+
+        # If we didn't process a line (e.g., no data waiting, port closed), yield CPU briefly
+        if not processed_line:
+            time.sleep(0.1) # Prevent busy-waiting when idle
+
+    print("Serial reading thread finished.")
+
+# open_serial and close_serial functions remain the same
+def open_serial():
+    """Opens the serial port connection."""
+    global serial_connection
+    if serial_connection and serial_connection.is_open: return True
+    try:
+        print(f"Attempting to open serial port {SERIAL_PORT} at {BAUD_RATE} baud...")
+        serial_connection = serial.Serial(port=SERIAL_PORT, baudrate=BAUD_RATE,
+                                          bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE,
+                                          stopbits=serial.STOPBITS_ONE, timeout=1)
+        if serial_connection.is_open:
+            print(f"Serial port {SERIAL_PORT} opened successfully.")
+            serial_connection.reset_input_buffer(); serial_connection.reset_output_buffer()
+            return True
+        else:
+            print(f"Failed to open serial port {SERIAL_PORT} (is_open is false).")
+            serial_connection = None; return False
+    except serial.SerialException as e:
+        print(f"Error opening serial port {SERIAL_PORT}: {e}")
+        serial_connection = None; return False
+    except Exception as e:
+        print(f"Unexpected error opening serial port: {e}")
+        serial_connection = None; return False
+
+def close_serial():
+    """Closes the serial port connection."""
+    global serial_connection
+    if serial_connection and serial_connection.is_open:
+        try:
+            serial_connection.close(); print("Serial port closed.")
+        except Exception as e: print(f"Error closing serial port: {e}")
+    serial_connection = None
+# --- End Serial Port Handling ---
+
+
+# --- MQTT Setup (Unchanged) ---
+def setup_mqtt():
+    """Sets up and connects the MQTT client."""
+    global mqtt_client
+    try:
+        try: # V2 API
+            mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=MQTT_CLIENT_ID, clean_session=True)
+            print("Using paho-mqtt v2 API.")
+            mqtt_client.on_disconnect = on_disconnect
+            mqtt_client.on_publish = on_publish
+        except AttributeError: # Fallback V1
+            print("paho-mqtt v2 API not found, falling back to v1 compatible.")
+            mqtt_client = mqtt.Client(client_id=MQTT_CLIENT_ID, clean_session=True)
+            mqtt_client.on_disconnect = lambda c, u, rc: print(f"Disconnected (v1 API): rc={rc}")
+            mqtt_client.on_publish = lambda c, u, mid: None # Suppress v1 logs
+
+        mqtt_client.on_connect = on_connect
+        mqtt_client.on_message = on_message
+        if MQTT_USERNAME and MQTT_PASSWORD: mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+
+        lwt_payload = json.dumps({"status": "offline", "reason": "unexpected disconnect", "timestamp": get_utc_iso_timestamp()})
+        mqtt_client.will_set(MQTT_TOPIC_GPS_STATUS, payload=lwt_payload, qos=1, retain=True)
+
+        print(f"Attempting to connect to MQTT broker {MQTT_BROKER}:{MQTT_PORT}...")
+        mqtt_client.connect_async(MQTT_BROKER, MQTT_PORT, 60)
+        mqtt_client.loop_start()
+        return True
+    except Exception as e: print(f"Error setting up MQTT: {e}"); return False
+# --- End MQTT Setup ---
+
+
+# --- Main Execution & Shutdown (Revised: Periodic Status Publish) ---
+def signal_handler(signum, frame):
+    print(f"\nSignal {signum} received, initiating shutdown...")
+    shutdown_flag.set()
 
 def main():
-    logging.info("Starting GPS monitoring script...")
-    gps_data = GPSData()
-    last_status_publish_time = 0
-    last_position_publish_time = 0
-    reconnect_delay = 1 # Initial delay in seconds
-    max_reconnect_delay = 60 # Maximum delay
+    global mqtt_client, last_status_publish_time
 
-    position_publish_interval = 0.25 # Target ~4Hz
-    status_publish_interval = 1.0   # Target 1Hz
+    print("Starting GPS Lap Monitor...")
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
-    global ser # Allow modification of the global serial object
+    if not open_serial(): print("Warning: Failed to open serial port on startup. Will retry.")
+    if not setup_mqtt(): print("Critical: Failed to setup MQTT on startup. Exiting."); close_serial(); return 1
 
-    while True:
-        try:
-            # --- Connection Management ---
+    serial_thread = threading.Thread(target=read_from_serial, name="SerialReader", daemon=True)
+    serial_thread.start()
 
-            # 1. Ensure MQTT is connected
-            if not client.is_connected():
-                logging.info("MQTT disconnected. Attempting to reconnect...")
-                if not connect_mqtt():
-                    logging.warning(f"MQTT reconnection failed. Retrying in {reconnect_delay} seconds.")
-                    time.sleep(reconnect_delay)
-                    reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
-                    continue # Retry connection phase
-                else:
-                    reconnect_delay = 1 # Reset delay on successful MQTT connection
+    status_publish_interval = 1.0 # Publish status at least every 1 second
 
-            # 2. Ensure Serial Port is connected
-            if ser is None or not ser.is_open:
-                 logging.info("Serial port not connected. Attempting to connect...")
-                 ser = connect_serial()
-                 if not ser:
-                    logging.warning(f"Serial connection failed. Retrying in {reconnect_delay} seconds.")
-                    time.sleep(reconnect_delay)
-                    reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
-                    continue # Retry connection phase
+    try:
+        while not shutdown_flag.is_set():
+            now = time.time()
+
+            # --- Periodic GPS Status Publish ---
+            # Publish status if enough time has passed since the last publish,
+            # regardless of NMEA updates. Acts as a heartbeat.
+            if (now - last_status_publish_time) >= status_publish_interval:
+                # print(f"Debug: Periodic status publish check ({(now - last_status_publish_time):.1f}s elapsed)") # Debug
+                publish_gps_status() # This also updates last_status_publish_time
+
+            # --- Check Serial Thread Health ---
+            if not serial_thread.is_alive():
+                 print("Error: Serial reading thread died. Attempting restart...")
+                 close_serial(); time.sleep(0.1)
+                 if open_serial():
+                     serial_thread = threading.Thread(target=read_from_serial, name="SerialReader", daemon=True)
+                     serial_thread.start()
+                     print("Serial thread restarted.")
                  else:
-                    reconnect_delay = 1 # Reset delay on successful serial connection
+                     print("Error: Could not reopen serial port for thread restart. Shutting down.")
+                     shutdown_flag.set() # Trigger shutdown if restart fails
 
+            # Sleep for a short duration before next check cycle
+            # Adjust sleep time based on desired responsiveness vs CPU usage
+            # Sleep duration should be less than status_publish_interval
+            time.sleep(0.5) # Check status/health twice per second
 
-            # --- Inner loop for reading serial data ---
-            logging.info("Connections established. Starting serial read loop.")
-            consecutive_error_count = 0
-            max_consecutive_errors = 10 # How many errors before breaking inner loop
-
-            while True: # Keep reading from serial as long as it's open and MQTT is connected
-                current_time = time.time()
-
-                # Check MQTT connection periodically within the inner loop
-                if not client.is_connected():
-                     logging.warning("MQTT connection lost during serial read loop. Breaking to reconnect.")
-                     break # Exit inner loop to trigger MQTT reconnect in outer loop
-
-                try:
-                    # Check if data is available using in_waiting
-                    # This can raise OSError: [Errno 5] if the device disconnects abruptly
-                    bytes_waiting = ser.in_waiting
-
-                    if bytes_waiting > 0:
-                        line = ser.readline()
-                        if not line: # Should not happen if in_waiting > 0, but safety check
-                             logging.warning("Readline returned empty despite data waiting.")
-                             time.sleep(0.05) # Small pause
-                             continue
-
-                        try:
-                            # Decode with error replacement for robustness
-                            line_str = line.decode('ascii', errors='replace').strip()
-
-                            # Skip empty lines or lines not starting with NMEA '$'
-                            if not line_str or not line_str.startswith('$'):
-                                # logging.debug(f"Skipping non-NMEA line: {line_str}")
-                                continue
-
-                            # Parse the NMEA sentence
-                            msg = pynmea2.parse(line_str)
-
-                            # Update GPS data state
-                            gps_data.update_from_nmea(msg)
-
-                            # Reset error count on successful parse
-                            consecutive_error_count = 0
-
-                            # --- Publishing Logic ---
-
-                            # Publish Position data at target interval if fix is available
-                            if gps_data.has_fix and (current_time - last_position_publish_time >= position_publish_interval):
-                                position_json = gps_data.get_position_json()
-                                if position_json: # Ensure we got valid JSON
-                                    result, mid = client.publish(MQTT_TOPIC_POSITION, position_json, qos=1) # Use QoS 1 for position
-                                    if result != mqtt.MQTT_ERR_SUCCESS:
-                                        logging.warning(f"Failed to publish position data (Result code: {result})")
-                                    # Optional: Log published position less frequently
-                                    # logging.debug(f"Published Position: {position_json}")
-                                last_position_publish_time = current_time
-
-                            # Publish Status data at target interval (always)
-                            if current_time - last_status_publish_time >= status_publish_interval:
-                                status_json = gps_data.get_status_json()
-                                result, mid = client.publish(MQTT_TOPIC_STATUS, status_json, qos=0) # Use QoS 0 for status
-                                if result != mqtt.MQTT_ERR_SUCCESS:
-                                     logging.warning(f"Failed to publish status data (Result code: {result})")
-                                logging.info(f"Status: {status_json}") # Log status periodically
-                                last_status_publish_time = current_time
-
-                        except pynmea2.ParseError as e:
-                            logging.warning(f"NMEA Parse Error: {e} on line: {line_str}")
-                            continue # Skip this line, try the next one
-                        except UnicodeDecodeError as e:
-                            logging.warning(f"Unicode Decode Error: {e} on raw line: {line!r}")
-                            continue # Skip this line
-
-                    else:
-                        # No data waiting, sleep briefly to prevent high CPU usage
-                        time.sleep(0.01)
-
-                except serial.SerialException as e:
-                    logging.error(f"Serial error during read/check: {e}")
-                    # This often indicates disconnection or a more serious issue
-                    try: # Attempt to close the faulty port
-                        if ser and ser.is_open:
-                            ser.close()
-                    except Exception as close_err:
-                         logging.error(f"Error closing serial port after read error: {close_err}")
-                    ser = None # Mark serial as disconnected
-                    break # Exit inner loop to trigger serial reconnect in outer loop
-
-                except OSError as e:
-                     # Catch specific OS errors like [Errno 5] Input/output error from in_waiting
-                     logging.error(f"OS error during serial operation: {e}")
-                     consecutive_error_count += 1
-                     if consecutive_error_count > max_consecutive_errors:
-                          logging.warning(f"Too many consecutive OS errors ({consecutive_error_count}), breaking inner loop.")
-                          try:
-                              if ser and ser.is_open: ser.close()
-                          except Exception as close_err:
-                               logging.error(f"Error closing serial port after OS error: {close_err}")
-                          ser = None
-                          break # Exit inner loop
-                     time.sleep(0.5) # Pause after an OS error before retrying
-
-                except Exception as e:
-                    # Catch any other unexpected errors in the inner loop
-                    logging.error(f"Unexpected error in inner loop: {e}", exc_info=True) # Log traceback
-                    consecutive_error_count += 1
-                    if consecutive_error_count > max_consecutive_errors:
-                        logging.warning(f"Too many consecutive errors ({consecutive_error_count}), breaking inner loop.")
-                        try: # Attempt to close port on repeated errors
-                            if ser and ser.is_open: ser.close()
-                        except Exception as close_err:
-                             logging.error(f"Error closing serial port after general error: {close_err}")
-                        ser = None
-                        break # Exit inner loop
-                    time.sleep(0.5) # Short pause after an unexpected error
-            # --- End of inner loop ---
-            logging.info("Exited serial read loop.")
-
-        except KeyboardInterrupt:
-            logging.info("KeyboardInterrupt received, initiating shutdown.")
-            # The signal handler (registered earlier) will perform cleanup.
-            break # Exit the main while loop
-
-        except Exception as e:
-            # Catch errors in the outer loop (connection setup, unexpected issues)
-            logging.error(f"Fatal error in main loop: {e}", exc_info=True)
-            # Ensure connections are reset before retrying
+    except Exception as e:
+        print(f"Unexpected error in main loop: {e}")
+        shutdown_flag.set()
+    finally:
+        print("Shutting down...")
+        if mqtt_client:
+            print("Publishing final offline status...")
             try:
-                if ser is not None and ser.is_open:
-                    ser.close()
-            except Exception as close_err:
-                 logging.error(f"Error closing serial port after main loop error: {close_err}")
-            ser = None
+                final_status = {"status": "offline", "reason": "clean shutdown", "timestamp": get_utc_iso_timestamp()}
+                publish_to_mqtt(MQTT_TOPIC_GPS_STATUS, final_status, qos=1, retain=True)
+                time.sleep(0.5) # Allow time for publish
+            except Exception as pub_e: print(f"Warning: Could not publish final status: {pub_e}")
+
+            print("Stopping MQTT client...")
             try:
-                if client.is_connected():
-                    client.loop_stop()
-                    client.disconnect()
-            except Exception as mqtt_err:
-                 logging.error(f"Error disconnecting MQTT after main loop error: {mqtt_err}")
+                mqtt_client.loop_stop(); mqtt_client.disconnect(); print("MQTT client disconnected.")
+            except Exception as disc_e: print(f"Error during MQTT disconnect: {disc_e}")
 
-            logging.info(f"Retrying after main loop error in {reconnect_delay} seconds.")
-            time.sleep(reconnect_delay)
-            reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
+        if serial_thread.is_alive():
+            print("Waiting for serial thread to exit..."); serial_thread.join(timeout=3.0)
+            if serial_thread.is_alive(): print("Warning: Serial thread did not exit cleanly.")
 
-    logging.info("GPS monitoring script finished.")
-    # Cleanup is handled by the signal_handler upon exit
+        close_serial()
+        print("GPS Lap Monitor stopped.")
+        sys.exit(0)
 
 if __name__ == "__main__":
     main()
