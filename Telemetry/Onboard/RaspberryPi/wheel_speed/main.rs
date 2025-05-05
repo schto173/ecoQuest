@@ -10,7 +10,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::collections::VecDeque;
 
-const GPIO_PIN: u8 = 17;
+const GPIO_PIN: u8 = 26;
 const TIMEOUT_SECS: u64 = 2;
 const DEBOUNCE_MS: u64 = 20;
 const STATUS_FILE: &str = "/tmp/wheel_speed.json";
